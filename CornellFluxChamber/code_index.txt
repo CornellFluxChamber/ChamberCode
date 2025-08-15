@@ -1,0 +1,3 @@
+flux_chamber.c - is deployable prototype code, it stops the motor based on switch feedback
+flux_chamber_time.c - is the code used for testing in the lab, the motor is time-based and does not use the switches
+flux_chamber_sensor_watchdog.c - is wip code for further optimization using sensor watchdog

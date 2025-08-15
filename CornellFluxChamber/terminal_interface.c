@@ -1,3 +1,9 @@
+/*
+ * terminal_interface.c
+ *
+ * Works like your computer's terminal or PowerShell. Start with 'help' to find
+ * the valid commands.
+ */
 
 /*
  FatFs license
@@ -187,7 +193,40 @@ specific language governing permissions and limitations under the License.
  * +------+---------+---------+- -  - -+---------+-----------+----------+
  */
 
-#include <stdlib.h>
+/*
+ * Copyright (c) 2022, Sensirion AG
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * * Redistributions of source code must retain the above copyright notice, this
+ *   list of conditions and the following disclaimer.
+ *
+ * * Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * * Neither the name of Sensirion AG nor the names of its
+ *   contributors may be used to endorse or promote products derived from
+ *   this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+// ==================================================
+// === initializations
+// ==================================================
 #include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
@@ -199,91 +238,56 @@ FRESULT fr;
 FATFS fs;
 
 // protothreads
-#include "hardware/sync.h"
-#include "hardware/timer.h"
 #include "pico/multicore.h"
-// protothreads header
-#include "hardware/uart.h"
 #include "pt_cornell_rp2040_v1_3.h"
-// int data_array[1000];
 
 // data logging
 #include "pico/unique_id.h"
-#include "pico/util/datetime.h"
 #include "hardware/rtc.h"
 
-// ==================================================
-// === toggle25 thread on core 0
-// ==================================================
-// the on-board LED blinks
-static PT_THREAD(protothread_toggle25(struct pt *pt))
-{
-    PT_BEGIN(pt);
-    static bool LED_state = false;
+// SCD30 co2 sensor
+#include "scd30_i2c.h"
+#include "sensirion_common.h"
+#include "sensirion_i2c_hal.h"
 
-    // set up LED p25 to blink
-    gpio_init(25);
-    gpio_set_dir(25, GPIO_OUT);
-    gpio_put(25, true);
-    // data structure for interval timer
-    PT_INTERVAL_INIT();
-
-    while (1)
-    {
-        // yield time 0.5 second
-        // PT_YIELD_usec(100000) ;
-        PT_YIELD_INTERVAL(500000);
-
-        // toggle the LED on PICO
-        LED_state = LED_state ? false : true;
-        gpio_put(25, LED_state);
-        //
-        // NEVER exit while
-    } // END WHILE(1)
-    PT_END(pt);
-} // blink thread
+// methane sensor
+#include "hardware/adc.h"
 
 // ===========================================
-// serial and file i/o
+// === serial and file i/o thread on core 1
 // ===========================================
-// The command interpreter is largely copied from
-// the tinyusb disribution.
+// The command interpreter is largely copied from the tinyusb disribution.
 // https://github.com/hathach/tinyusb/blob/master/examples/host/msc_file_explorer/src/main.c
 // See license at top of file
 // ===========================================
-static PT_THREAD(protothread_file(struct pt *pt))
+static PT_THREAD(protothread_chamber(struct pt *pt))
 {
     PT_BEGIN(pt);
-    // static char serial_buffer[40];
     static char cmd[16], arg1[64], arg2[16], arg3[16];
     static char *token;
-    // float farg;
-    // int arg;
-    // static long long start_time;
-
-    char datetime_buf[256];
-    char *datetime_str = &datetime_buf[0];
 
     // Default datetime set to Sunday 01 January 00:00:00 2000
+    char datetime_buf[256];
+    char *datetime_str = &datetime_buf[0];
+    rtc_init();
     datetime_t t = {
         .year = 2000,
         .month = 01,
         .day = 01,
-        .dotw = 0, // 0 is Sunday, so 5 is Friday
         .hour = 00,
         .min = 00,
         .sec = 00};
-    rtc_init();
     rtc_set_datetime(&t);
-    sleep_ms(100);
 
-    static int logging_frequency_ms = 5000; // Default logging frequency [ms] -- 5 seconds
+    // Default time between each data measurement entry [ms] -- 5 seconds
+    static int logging_period_ms = 5000;
 
     // Initialize SD card
     if (!sd_init_driver())
     {
         printf("ERROR: Could not initialize SD card\r\n");
-        while (true);
+        while (true)
+            ;
     }
 
     // Mount drive
@@ -291,20 +295,77 @@ static PT_THREAD(protothread_file(struct pt *pt))
     if (fr != FR_OK)
     {
         printf("ERROR: Could not mount filesystem (%d)\r\n", fr);
-        while (true);
+        while (true)
+            ;
     }
 
+    // Initialize KN3904 (npn) transistor for power
+    gpio_init(11);
+    gpio_set_dir(11, GPIO_OUT);
+    gpio_put(11, 1);        // turn on power to SCD30
+    // Initialize SCD30 Sensor
+    float co2 = 0.0;
+    float temp = 0.0;
+    float hum = 0.0;
+    int16_t error = NO_ERROR;
+    sensirion_i2c_hal_init();
+    init_driver(SCD30_I2C_ADDR_61);
+    // make sure the sensor is in a defined state
+    // (soft reset does not stop periodic measurement)
+    scd30_stop_periodic_measurement();
+    scd30_soft_reset();
+    sensirion_i2c_hal_sleep_usec(2000000);
+    uint8_t major = 0;
+    uint8_t minor = 0;
+    error = scd30_read_firmware_version(&major, &minor);
+    if (error != NO_ERROR)
+    {
+        printf("error executing read_firmware_version(): %i\n", error);
+        return error;
+    }
+    printf("firmware version major: %u minor: %u\n", major, minor);
+    // The 0 parameter disables ambient pressure compensation (can be replaced 
+    // with actual pressure value in mBar if needed).
+    error = scd30_start_periodic_measurement(0);
+    if (error != NO_ERROR)
+    {
+        printf("error executing start_periodic_measurement(): %i\n", error);
+        return error;
+    }
+
+    // Initialize ADC... for Methane Sensor
+    adc_init();
+    adc_gpio_init(26);   // Make sure GPIO is high-impedance, no pullups etc
+    adc_select_input(0); // Select ADC input 0 (GPIO26)
+
+    // Initialize Motor Pins
+    gpio_init(18);              // enable pin
+    gpio_set_dir(18, GPIO_OUT);
+    gpio_init(17);              // step pin
+    gpio_set_dir(17, GPIO_OUT);
+    gpio_init(16);              // direction pin
+    gpio_set_dir(16, GPIO_OUT);
+    gpio_put(18, 1);            // disable motor when not in use
+
+    // Initialize Switch Pins
+    gpio_init(20);              // limit switch
+    gpio_set_dir(20, GPIO_IN);
+    gpio_pull_up(20);
+    gpio_init(21);              // float switch
+    gpio_set_dir(21, GPIO_IN);
+    gpio_pull_up(21);
+
+    printf("Default date: Sunday 01 January 00:00:00 2000\n");
+    printf("Default period: 5 seconds\n");
+    printf("Enter 'help' to find the valid commands\n");
+
+    // main loop of terminal interface
     while (1)
     {
-        rtc_get_datetime(&t);
-        datetime_to_str(datetime_str, sizeof(datetime_buf), &t);
-        sleep_ms(100);
-        // printf("\n\r%s      \n", datetime_str);
-
         printf(">>");
         // spawn a thread to do the non-blocking serial read
         serial_read;
-        // tokenize
+        // tokenize serial input
         token = strtok(pt_serial_in_buffer, "  ");
         strcpy(cmd, token);
         token = strtok(NULL, "  ");
@@ -314,33 +375,73 @@ static PT_THREAD(protothread_file(struct pt *pt))
         token = strtok(NULL, "  ");
         strcpy(arg3, token);
 
+        // different cases for different commands
         // ===
         if (strcmp(cmd, "help") == 0)
         {
             printf("*****\n\r");
-            printf("[1] setdate <yyy-mm-dd> <hh:mm:ss> -- set the RTC intialization of date/time\n\r");
-            printf("[2] setfreq <frequency> -- set the data logging frequency in ms\n\r");
-            printf("[3] write <filename> -- write the Pico unique ID, date/time, and data to file saved as .txt or .csv (specify format in filename)\n\r");
-            printf("[4] print <filename> -- print the content of the filename\n\r");
-            printf("[5] rm <filename> -- delinks (deletes) a file\n\r");
-            printf("[6] ls <directory> -- list directory contents\n\r");
-            printf("[7] cd <directory> -- changes current directory\n\r");
-            printf("[8] mkdir <directory> -- new directory\n\r");
-            // Bruce's methods
-            // printf("write filename number -- text data write -- writes ints to number\n\r");
-            // printf("read filename -- text data read -- ints (from write command)\n\r");
-            // printf("writebin filename range  -- demo binary data write -- ints to range\n\r");
-            // printf("readbin filename range  -- demo binary data read -- ints to range\n\r");
-            // printf("plot filename -- data to VGA\n\r") ;
+            printf("[1] test_motor <direction> -- run the motor up/down "
+                "for a certain number of steps \n\r");
+            printf("[2] set_date <yyyy-mm-dd> <hh:mm:ss> -- set the RTC "
+                "intialization of date/time\n\r");
+            printf("[3] set_per <period> -- set the data logging period in ms\n\r");
+            printf("[4] write <filename> -- write the Pico unique ID, date/time"
+                ", and data to file saved as .txt or .csv (specify format in "
+                "filename)\n\r");
+            printf("[5] print <filename> -- print the content of the filename"
+                "\n\r");
+            printf("[6] rm <filename> -- delinks (deletes) a file\n\r");
+            printf("[7] ls <directory> -- list directory contents\n\r");
+            printf("[8] cd <directory> -- changes current directory\n\r");
+            printf("[9] mkdir <directory> -- new directory\n\r");
             printf("*****\n\r");
         }
         
         // ===
-        if (strcmp(cmd, "setdate") == 0)
+        if (strcmp(cmd, "test_motor") == 0)
         {
-            static char year[16], month[16], day[16], hour[16], minute[16], second[16];
+            char dir_str[10];
+            int steps;
+
+            if ((sscanf(arg1, "%s", dir_str) == 1) && ((strcmp(dir_str, "up") == 0) || (strcmp(dir_str, "down") == 0)))
+            {
+                int direction; 
+                direction = (strcmp(dir_str, "up") == 0) ? 0 : 1;
+                if (direction) 
+                {
+                    printf("Moving motor down. Raise the float to stop.\n");
+                }
+                else
+                {
+                    printf("Moving motor up. Press the limit switch to stop.\n");
+
+                }
+              
+                gpio_put(18, 0);            // enable motor
+                gpio_put(16, direction);
+                while (gpio_get(20 + direction) == !direction) {
+                    gpio_put(17, true);
+                    sleep_us(1000);
+                    gpio_put(17, false);
+                    sleep_us(1000);
+                }
+                gpio_put(18, 1);            // disable motor
+            }
+            else
+            {
+                printf("Invalid direction. Please use 'up' or 'down'.\n");
+            }
+        }
+
+        // ===
+        if (strcmp(cmd, "set_date") == 0)
+        {
+            static char year[16], month[16], day[16];
+            static char hour[16], minute[16], second[16];
             static char *datetoken, *timetoken;
             char date, time;
+
+            // tokenize serial input
             if (sscanf(arg1, "%s", &date) == 1 && sscanf(arg2, "%s", &time) == 1)
             {
                 datetoken = strtok(&date, "-");
@@ -357,23 +458,18 @@ static PT_THREAD(protothread_file(struct pt *pt))
                 timetoken = strtok(NULL, ":");
                 strcpy(second, timetoken);
 
-                printf("Setting RTC to %s-%s-%s %s:%s:%s\n\r", &year, &month, &day, &hour, &minute, &second);
+                printf("Setting RTC to %s-%s-%s %s:%s:%s\n\r", &year, &month, 
+                    &day, &hour, &minute, &second);
 
-                // For day of the week calculation
-                static int calc_info[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-                int calc_year = atoi(year) - (atoi(month) < 3);
-
+                rtc_init();
                 datetime_t t = {
                     .year = atoi(year),
                     .month = atoi(month),
                     .day = atoi(day),
-                    .dotw = (calc_year + calc_year/4 - calc_year/100 + calc_year/400 + calc_info[atoi(month)-1] + atoi(day)) % 7, // 0 is Sunday, so 5 is Friday
                     .hour = atoi(hour),
                     .min = atoi(minute),
                     .sec = atoi(second)};
-                rtc_init();
                 rtc_set_datetime(&t);
-                sleep_ms(100);
             }
             else
             {
@@ -382,17 +478,17 @@ static PT_THREAD(protothread_file(struct pt *pt))
         }
 
         // ===
-        if (strcmp(cmd, "setfreq") == 0)
+        if (strcmp(cmd, "set_per") == 0)
         {
-            int freq;
-            if (sscanf(arg1, "%d", &freq) == 1 && freq > 0)
+            int per;
+            if (sscanf(arg1, "%d", &per) == 1 && per > 0)
             {
-                logging_frequency_ms = freq;
-                printf("Logging frequency set to %d ms\n", logging_frequency_ms);
+                logging_period_ms = per;
+                printf("Logging period set to %d ms\n", logging_period_ms);
             }
             else
             {
-                printf("Invalid frequency. Please enter a positive integer.\n");
+                printf("Invalid period. Please enter a positive integer.\n");
             }
         }
 
@@ -408,53 +504,89 @@ static PT_THREAD(protothread_file(struct pt *pt))
             }
             else
             {
-                // Write header
                 UINT wr_count = 0;
-                
+                char *NEW_LINE = "\n";
+
+                // Write UTF-8 BOM (for excel to interpret special characters)
+                BYTE bom[] = {0xEF, 0xBB, 0xBF};
+                f_write(&f_dst, bom, sizeof(bom), &wr_count);
+
+                // Write pico id
                 pico_get_unique_board_id(&PICO_ID);
-                char id_str[PICO_UNIQUE_BOARD_ID_SIZE_BYTES * 2]; // Buffer for hexadecimal string
+                // Buffer for hexadecimal string
+                char id_str[PICO_UNIQUE_BOARD_ID_SIZE_BYTES * 2]; 
                 for (int i = 0; i < PICO_UNIQUE_BOARD_ID_SIZE_BYTES; i++)
                 {
                     // Append each byte in hexadecimal format to the buffer
                     sprintf(&id_str[i * 2], "%02X", PICO_ID.id[i]);
                 }
                 printf("ID is: %s \n", id_str);
-
-                char *DATA_HEADER = "DATETIME,CH4,CO2,TEMP,HUM\n";
-
                 f_write(&f_dst, "Pico ID,", strlen("Pico ID,"), &wr_count);
-                sleep_ms(20);                                       // Delay for write to complete
-                f_write(&f_dst, id_str, strlen(id_str), &wr_count); // Write the ID string to the file
-                sleep_ms(20);
-                f_write(&f_dst, "\n\r", strlen("\n\r"), &wr_count);
-                sleep_ms(20);
+                f_write(&f_dst, id_str, strlen(id_str), &wr_count);
+                f_write(&f_dst, NEW_LINE, strlen(NEW_LINE), &wr_count);
+
+                // Write header
+                const char *DATA_HEADER = "DATETIME,TEMP (°C),HUM (%RH),CO2 (ppm),CH4\n";
                 f_write(&f_dst, DATA_HEADER, strlen(DATA_HEADER), &wr_count);
-                sleep_ms(20);
 
                 // Write contents
-                int test = 3;
-                while (test > 0)
+                for (int i = 0; i < 5; i++) 
                 {
-                    test--;
-                    sleep_ms(logging_frequency_ms);
-                    char *DATA = "12.2,10,70,45\n";
-                    UINT wr_count = 0;
+                    // Sleep between writes
+                    sleep_ms(logging_period_ms);
 
+                    // Get & write date/time
                     rtc_get_datetime(&t);
-                    datetime_to_str(datetime_str, sizeof(datetime_buf), &t);
-                    sleep_ms(100);
-
-                    printf("writing to file...\n");
+                    char datetime_str[20] = {0};
+                    snprintf(datetime_str, sizeof(datetime_str),
+                            "%02d/%02d/%02d %02d:%02d:%02d",
+                            t.month, t.day, t.year % 100,
+                            t.hour, t.min, t.sec);
                     f_write(&f_dst, datetime_str, strlen(datetime_str), &wr_count);
-                    sleep_ms(20);
                     f_write(&f_dst, ",", strlen(","), &wr_count);
-                    sleep_ms(20);
-                    f_write(&f_dst, DATA, strlen(DATA), &wr_count);
-                    sleep_ms(20);
+
+                    // Get & write temperature, humidity, co2 concentration
+                    error = scd30_blocking_read_measurement_data(&co2, &temp, &hum);
+                    if (error != NO_ERROR)
+                    {
+                        printf("Error executing blocking_read_measurement_data"
+                            "(): %i\n", error);
+                        continue;
+                    }
+
+                    printf("TEMP: %f", temp);
+                    char temp_str[10] = {0};
+                    sprintf(temp_str, "%f", temp);
+                    f_write(&f_dst, temp_str, strlen(temp_str), &wr_count);
+                    f_write(&f_dst, ",", strlen(","), &wr_count);
+
+                    printf(", HUM: %f", hum);
+                    char hum_str[10] = {0};
+                    sprintf(hum_str, "%f", hum);
+                    f_write(&f_dst, hum_str, strlen(hum_str), &wr_count);
+                    f_write(&f_dst, ",", strlen(","), &wr_count);
+
+                    printf(", CO2: %f", co2);
+                    char co2_str[10] = {0};
+                    sprintf(co2_str, "%f", co2);
+                    f_write(&f_dst, co2_str, strlen(co2_str), &wr_count);
+                    f_write(&f_dst, ",", strlen(","), &wr_count);
+
+                    // Get & write methane concentration
+                    uint16_t methane = adc_read();
+                    printf(", CH4: %d\n", methane);
+                    char methane_str[10] = {0};
+                    sprintf(methane_str, "%d", methane);
+                    f_write(&f_dst, methane_str, strlen(methane_str), &wr_count);
+
+                    // Create new line
+                    f_write(&f_dst, NEW_LINE, strlen(NEW_LINE), &wr_count);
+
+                    // Write cached information periodically
+                    f_sync(&f_dst);
                 }
-                printf("Exited while loop\n");
+                f_close(&f_dst);
             }
-            f_close(&f_dst);
         }
 
         // ===
@@ -469,7 +601,8 @@ static PT_THREAD(protothread_file(struct pt *pt))
             {
                 uint8_t buf[512];
                 UINT count = 0;
-                while ((FR_OK == f_read(&fi, buf, sizeof(buf), &count)) && (count > 0))
+                while ((FR_OK == f_read(&fi, buf, sizeof(buf), &count)) && 
+                (count > 0))
                 {
                     for (UINT c = 0; c < count; c++)
                     {
@@ -488,7 +621,8 @@ static PT_THREAD(protothread_file(struct pt *pt))
             const char *fpath = arg1; // token count from 1
             if (FR_OK != f_unlink(fpath))
             {
-                printf("cannot remove '%s': No such file or directory\r\n", fpath);
+                printf("Cannot remove '%s': No such file or directory\r\n", 
+                    fpath);
             }
         }
 
@@ -503,16 +637,16 @@ static PT_THREAD(protothread_file(struct pt *pt))
             DIR dir;
             if (FR_OK != f_opendir(&dir, dpath))
             {
-                printf("cannot access '%s': No such file or directory\r\n", dpath);
+                printf("Cannot access '%s': No such file or directory\r\n", 
+                    dpath);
             }
 
             char path[256];
             if (FR_OK != f_getcwd(path, sizeof(path)))
             {
-                printf("cannot get current working directory\r\n");
+                printf("Cannot get current working directory\r\n");
             }
 
-            // puts(path);
             printf("Current directory: %s\n\r", path);
 
             FILINFO fno;
@@ -560,139 +694,10 @@ static PT_THREAD(protothread_file(struct pt *pt))
             const char *dpath = arg1;
             if (FR_OK != f_mkdir(dpath))
             {
-                printf("%s: cannot create this directory\r\n", dpath);
+                printf("%s: Cannot create this directory\r\n", dpath);
             }
         }
-
-
-        // // === Bruce's Original write
-        // if (strcmp(cmd, "write") == 0)
-        // {
-        //     FIL f_dst;
-        //     if (FR_OK != f_open(&f_dst, arg1, FA_WRITE | FA_CREATE_ALWAYS))
-        //     {
-        //         printf("cannot create '%s'\r\n", arg1);
-        //     }
-        //     else
-        //     {
-        //         // uint8_t buf[32] = "Data from Pico\n\r";
-        //         UINT wr_count = 0;
-        //         uint32_t range;
-        //         sscanf(arg2, "%d\0  ", &range);
-        //         sprintf(arg2, "%d ", range);
-        //         if (FR_OK != f_write(&f_dst, arg2, strlen(arg2), &wr_count))
-        //         {
-        //             printf("cannot write to '%s'\r\n", arg1);
-        //         }
-
-        //         for (int i = 0; i <= range; i++)
-        //         {
-        //             uint8_t data[10];
-        //             sprintf(data, "%d\n", i);
-        //             f_write(&f_dst, data, strlen(data), &wr_count);
-        //         }
-        //     }
-        //     f_close(&f_dst);
-        // }
-
-        // // ===
-        // if (strcmp(cmd, "writebin") == 0)
-        // {
-        //     FIL f_dst;
-        //     if (FR_OK != f_open(&f_dst, arg1, FA_WRITE | FA_CREATE_ALWAYS))
-        //     {
-        //         printf("cannot create '%s'\r\n", arg1);
-        //     }
-        //     else
-        //     {
-        //         UINT wr_count = 0;
-        //         // if ( FR_OK != f_write(&f_dst, buf, strlen(buf), &wr_count) )
-        //         // {
-        //         //     printf("cannot write to '%s'\r\n", arg1);
-        //         // }
-        //         uint32_t range;
-        //         sscanf(arg2, "%d", &range);
-        //         for (int i = 0; i <= range; i += 1)
-        //         {
-        //             data_array[i] = 2 * i;
-        //         }
-        //         // total byte count is range*4
-        //         start_time = PT_GET_TIME_usec();
-        //         f_write(&f_dst, data_array, range * 4, &wr_count);
-        //         printf("uSec/int =  %lld  \n", (PT_GET_TIME_usec() - start_time) / range);
-        //         // for checking read
-        //         for (int i = 0; i <= range; i += 1)
-        //         {
-        //             data_array[i] = 0;
-        //         }
-        //     }
-        //     f_close(&f_dst);
-        // }
-
-        // // ===
-        // if (strcmp(cmd, "read") == 0)
-        // {
-        //     FIL fi;
-        //     if (FR_OK != f_open(&fi, arg1, FA_READ))
-        //     {
-        //         printf("%s: No such file or directory\r\n", arg1);
-        //     }
-        //     else
-        //     {
-        //         uint8_t buf[100];
-        //         UINT count = 0;
-        //         // modify ff.c line 6848
-        //         // turn on f_gets option in ffconf.h
-        //         //
-        //         // get number of data points
-        //         int file_count;
-        //         f_gets(buf, sizeof(buf), &fi);
-        //         sscanf(buf, "%d", &file_count);
-        //         // read and plot
-        //         for (int i = 0; i <= file_count; i++)
-        //         {
-        //             f_gets(buf, sizeof(buf), &fi);
-        //             printf("%s", buf);
-        //         }
-        //     }
-        //     f_close(&fi);
-        // }
-
-        // // ===
-        // if (strcmp(cmd, "readbin") == 0)
-        // {
-        //     FIL fi;
-        //     if (FR_OK != f_open(&fi, arg1, FA_READ))
-        //     {
-        //         printf("%s: No such file or directory\r\n", arg1);
-        //     }
-        //     else
-        //     {
-        //         // uint8_t buf[512];
-        //         uint32_t range;
-        //         sscanf(arg2, "%d", &range);
-        //         start_time = PT_GET_TIME_usec();
-        //         UINT count = 0;
-        //         while ((FR_OK == f_read(&fi, data_array, range * 4, &count)) && (count > 0))
-        //         {
-        //             // for(UINT c = 0; c < count; c++)
-        //             // {
-        //             //     const uint8_t ch = buf[c];
-        //             //     putchar(ch);
-        //             // }
-        //         }
-        //         printf("uSec/int =  %lld  \n", (PT_GET_TIME_usec() - start_time) / range);
-        //         // just sample the file start
-        //         for (int i = 0; i <= 10; i += 1)
-        //         {
-        //             printf("%d\n", data_array[i]);
-        //         }
-        //     }
-        //     f_close(&fi);
-        // }
-
-        // NEVER exit while
-    } // END WHILE(1)
+    }
     PT_END(pt);
 } // file thread
 
@@ -701,11 +706,9 @@ static PT_THREAD(protothread_file(struct pt *pt))
 // ========================================
 void core1_main()
 {
-    //
     //  === add threads  ====================
     // for core 1
-    // pt_add_thread(protothread_vga) ;
-    pt_add_thread(protothread_file);
+    pt_add_thread(protothread_chamber);
     //
     // === initalize the scheduler ==========
     pt_sched_method = SCHED_ROUND_ROBIN;
@@ -720,8 +723,6 @@ void core1_main()
 // ========================================
 int main()
 {
-
-    // board_init();
     //  start the serial i/o
     stdio_init_all();
 
@@ -731,9 +732,7 @@ int main()
 
     // === config threads ========================
     // for core 0
-    pt_add_thread(protothread_toggle25);
 
-    //
     // === initalize the scheduler ===============
     pt_sched_method = SCHED_PRIORITY;
     pt_schedule_start;

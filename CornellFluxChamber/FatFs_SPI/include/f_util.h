@@ -13,7 +13,7 @@ specific language governing permissions and limitations under the License.
 */
 #pragma once
 // #include "C:\Users\16073\OneDrive\Documents\Pico-v1.5.0\FatFs_SPI\ff14a\source\ff.h"
-#include "../ff14a/source/ff.h"
+#include "ff.h"
 #ifdef __cplusplus
 extern "C"
 {
