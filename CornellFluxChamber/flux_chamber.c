@@ -196,9 +196,8 @@ void watchdog_deep_sleep(uint32_t sleep_time_ms, bool debug_mode) {
 }
 
 // Function to move motor - 0 is cw up, 1 is ccw down
-// flush_chamber_ms is the total time to flush the chamber air
 // returns elapsed time
-uint32_t move_motor(int direction, uint32_t flush_chamber_ms, bool debug_mode) {  
+uint32_t move_motor(int direction, bool debug_mode) {  
     if (debug_mode) {
         if (direction) { printf("Moving motor down...\n"); } 
         else { printf("Moving motor up...\n"); }
@@ -208,9 +207,9 @@ uint32_t move_motor(int direction, uint32_t flush_chamber_ms, bool debug_mode) {
 
     gpio_put(18, 0);            // enable motor
     gpio_put(16, direction);
-    // run until reach switch or time limit
+    // run until reach switch or time limit (of 1 min)
     while ((gpio_get(20 + direction) == !direction)
-        && (time_us_32() - start_us) / 1000 < flush_chamber_ms / 2) {
+    && (time_us_32() - start_us) / 1000 < 60000) {
         gpio_put(17, true);
         sleep_us(300);
         gpio_put(17, false);
@@ -220,8 +219,8 @@ uint32_t move_motor(int direction, uint32_t flush_chamber_ms, bool debug_mode) {
  
     if (gpio_get(20 + direction) == !direction) {
         if (direction) { 
-            printf("ERROR: Insufficient power. Failed to close chamber\n"); } 
-        else { printf("ERROR: Insufficient power. Failed to open chamber\n"); }
+            printf("ERROR: Insufficient power. Failed to close chamber.\n"); } 
+        else { printf("ERROR: Insufficient power. Failed to open chamber.\n"); }
     }
 
     return (time_us_32() - start_us) / 1000;  // elapsed time
@@ -274,19 +273,20 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
     static char filename[64] = "test.csv";
 
     // Date and time
-    int year = 2025, month = 8, day = 14;  // yyyy-m-d
-    int hour = 16, min = 30, sec = 0;      // h:m:s
+    int year = 2025, month = 10, day = 23;  // yyyy-m-d
+    int hour = 16, min = 0, sec = 0;      // h:m:s
 
     // Total time to log data each cycle [ms]
-    static uint32_t total_sampling_ms = 60000;
+    static uint32_t total_sampling_ms = 900000; // 15 min
 
     // Time between each data measurement entry [ms]
     // required: must be <= total_sampling_ms
-    static uint32_t sampling_interval_ms = 2000; // 5 s
+    static uint32_t sampling_interval_ms = 5000; // 5 s
 
     // Total time to flush the chamber air each cycle [ms]
+    // The canopy will open at the start of the time and close at the end
     // required: must be >= 2 x time to open/close chamber
-    static uint32_t flush_chamber_ms = 120000;
+    static uint32_t flush_chamber_ms = 600000;  // 10 min
     
     // Debug mode provides print statements to the serial monitor
     // Error messages still print without debug mode 
@@ -384,22 +384,16 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
         // === air exchange
         // ===========================================
         // Open chamber
-        elapsed_time_ms = move_motor(0, flush_chamber_ms, debug_mode); 
+        elapsed_time_ms = move_motor(0, debug_mode); 
 
         // Sleep
-        if (elapsed_time_ms < flush_chamber_ms/2) {
-            sleep_time_ms = flush_chamber_ms/2 - elapsed_time_ms;
+        if (elapsed_time_ms < flush_chamber_ms) {
+            sleep_time_ms = flush_chamber_ms - 2 * elapsed_time_ms;
             deep_sleep(sleep_time_ms, debug_mode);
         }
 
         // Close chamber
-        elapsed_time_ms = move_motor(1, flush_chamber_ms, debug_mode);
-
-        // Sleep
-        if (elapsed_time_ms < flush_chamber_ms/2) {
-            sleep_time_ms = flush_chamber_ms/2 - elapsed_time_ms;
-            deep_sleep(sleep_time_ms, debug_mode);
-        }
+        elapsed_time_ms = move_motor(1, debug_mode);
 
         // ===========================================
         // === log data
@@ -446,6 +440,13 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
             }
 
             // Write contents
+
+            // Write if motor was not supplied sufficient power
+            if (elapsed_time_ms >= 60000) {
+                f_write(&f_dst, "ERROR: Insufficient power to motor,", 
+                    strlen("ERROR: Insufficient power to motor,"), &wr_count);
+                f_write(&f_dst, NEW_LINE, strlen(NEW_LINE), &wr_count);
+            }
 
             // Enable watchdog for maximum 8000 ms
             // 2nd arg to pause on debug mode
