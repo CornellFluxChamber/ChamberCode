@@ -273,8 +273,8 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
     static char filename[64] = "test.csv";
 
     // Date and time
-    int year = 2025, month = 10, day = 23;  // yyyy-m-d
-    int hour = 16, min = 0, sec = 0;      // h:m:s
+    int year = 2026, month = 01, day = 01;  // yyyy-m-d
+    int hour = 0, min = 0, sec = 0;      // h:m:s
 
     // Total time to log data each cycle [ms]
     static uint32_t total_sampling_ms = 900000; // 15 min
@@ -323,7 +323,7 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
         while (1);
     }
 
-    // Initialize KN3904 (npn) transistor for power
+    // Initialize KN3904 (NPN) transistor for power
     gpio_init(11);
     gpio_set_dir(11, GPIO_OUT);
     gpio_put(11, 1);        // turn on power to SCD30
@@ -346,7 +346,7 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
         printf("Error executing read_firmware_version(): %i\n", error);
     }
     if (debug_mode) {
-        printf("firmware version major: %u minor: %u\n", major, minor);
+        printf("Firmware version major: %u minor: %u\n", major, minor);
     }
     // The 0 parameter disables ambient pressure compensation (can be replaced 
     // with actual pressure value in mBar if needed).
