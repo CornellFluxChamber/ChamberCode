@@ -180,7 +180,8 @@ void watchdog_deep_sleep(uint32_t sleep_time_ms, bool debug_mode) {
 
     while (remaining_time_ms > 0) {
         // maximum chunk size of 7000 ms 
-        uint32_t chunk_time_ms = (remaining_time_ms > 7000) ? 7000 : remaining_time_ms;
+        uint32_t chunk_time_ms = (remaining_time_ms > 7000) ? 7000 : 
+        remaining_time_ms;
 
         uart_default_tx_wait_blocking();
         sleep_run_from_xosc();
@@ -195,9 +196,8 @@ void watchdog_deep_sleep(uint32_t sleep_time_ms, bool debug_mode) {
 }
 
 // Function to move motor - 0 is cw up, 1 is ccw down
-// flush_chamber_ms is the total time to flush the chamber air
 // returns elapsed time
-uint32_t move_motor(int direction, int steps, uint32_t flush_chamber_ms, bool debug_mode) {  
+uint32_t move_motor(int direction, int steps, bool debug_mode) {  
     if (debug_mode) {
         if (direction) { printf("Moving motor down...\n"); } 
         else { printf("Moving motor up...\n"); }
@@ -209,7 +209,7 @@ uint32_t move_motor(int direction, int steps, uint32_t flush_chamber_ms, bool de
     gpio_put(16, direction);
     // run num of steps or until reach time limit
     int i = 0;
-    while ((i < steps) && (time_us_32() - start_us) / 1000 < flush_chamber_ms / 2) {
+    while ((i < steps) && (time_us_32() - start_us) / 1000 < 60000) {
         i++;
         gpio_put(17, true);
         sleep_us(300);
@@ -218,8 +218,7 @@ uint32_t move_motor(int direction, int steps, uint32_t flush_chamber_ms, bool de
     }
     gpio_put(18, 1);            // disable motor
  
-    uint32_t end_us = time_us_32();
-    return (end_us - start_us) / 1000;  // elapsed time
+    return (time_us_32() - start_us) / 1000;  // elapsed time
 }
 
 // Function to recover SCD30 sensor, while feeding watchdog
@@ -269,23 +268,26 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
     static char filename[64] = "test.csv";
 
     // Date and time
-    int year = 2025, month = 8, day = 12;  // yyyy-m-d
-    int hour = 13, min = 30, sec = 0;      // h:m:s
+    int year = 2026, month = 1, day = 1;  // yyyy-m-d
+    int hour = 0, min = 0, sec = 0;      // h:m:s
 
     // Total time to log data each cycle [ms]
-    // static uint32_t total_sampling_ms = 2400000; // 40 min
-    static uint32_t total_sampling_ms = 10000; // 1 min
+    // static uint32_t total_sampling_ms = 900000; // 15 min
+    static uint32_t total_sampling_ms = 60000; // 1 min
 
     // Time between each data measurement entry [ms]
-    static uint32_t sampling_interval_ms = 2000; // 2 s
+    // required: must be <= total_sampling_ms
+    static uint32_t sampling_interval_ms = 5000; // 5 s
 
     // Total time to flush the chamber air each cycle [ms]
-    // static uint32_t flush_chamber_ms = 1200000;  // 20 min
-    static uint32_t flush_chamber_ms = 10000;  // 2 min
+    // The canopy will open at the start of the time and close at the end
+    // required: must be >= 2 x time to open/close chamber
+    // static uint32_t flush_chamber_ms = 600000;  // 10 min
+    static uint32_t flush_chamber_ms = 60000; // 1 min
     
     // Debug mode provides print statements to the serial monitor
     // Error messages still print without debug mode 
-    static bool debug_mode = true;
+    static bool debug_mode = false;
 
     // ==================================================
     // === initializations
@@ -371,22 +373,16 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
         // === air exchange
         // ===========================================
         // Open chamber
-        elapsed_time_ms = move_motor(0, 35500, flush_chamber_ms, debug_mode); 
+        elapsed_time_ms = move_motor(0, 35500, debug_mode); 
         
         // Sleep
-        if (elapsed_time_ms < flush_chamber_ms/2) {
-            sleep_time_ms = flush_chamber_ms/2 - elapsed_time_ms;
+        if (elapsed_time_ms < flush_chamber_ms) {
+            sleep_time_ms = flush_chamber_ms - 2 * elapsed_time_ms;
             deep_sleep(sleep_time_ms, debug_mode);
         }
 
         // Close chamber
-        elapsed_time_ms = move_motor(1, 35500, flush_chamber_ms, debug_mode);
-        
-        // Sleep
-        if (elapsed_time_ms < flush_chamber_ms/2) {
-            sleep_time_ms = flush_chamber_ms/2 - elapsed_time_ms;
-            deep_sleep(sleep_time_ms, debug_mode);
-        }
+        elapsed_time_ms = move_motor(1, 35500, debug_mode);
 
         // ===========================================
         // === log data

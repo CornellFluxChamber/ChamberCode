@@ -273,7 +273,7 @@ static PT_THREAD(protothread_chamber(struct pt *pt))
     static char filename[64] = "test.csv";
 
     // Date and time
-    int year = 2026, month = 01, day = 01;  // yyyy-m-d
+    int year = 2026, month = 1, day = 1;  // yyyy-m-d
     int hour = 0, min = 0, sec = 0;      // h:m:s
 
     // Total time to log data each cycle [ms]
